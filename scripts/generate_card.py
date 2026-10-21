@@ -133,11 +133,11 @@ def fetch_avatar(url):
     # focus on head/shoulders: drop the lower strip of a square avatar
     img = img.crop((0, 0, w, int(h * 0.82)))
     img = ImageOps.autocontrast(img, cutoff=1)
-    img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=160, threshold=2))
+    img = img.filter(ImageFilter.GaussianBlur(radius=0.6))  # smooth sensor/jpeg noise before sampling
     return img
 
 
-def ascii_art_svg(img, avail_w, avail_h, row_fade, cw=2.6, ch=4.8):
+def ascii_art_svg(img, avail_w, avail_h, row_fade, cw=3.2, ch=5.8):
     rows = max(1, int(avail_h // ch))
     cols = max(1, min(int(avail_w // cw), round(rows * ch / cw)))
     rows = max(1, round(cols * cw / ch))
@@ -146,10 +146,11 @@ def ascii_art_svg(img, avail_w, avail_h, row_fade, cw=2.6, ch=4.8):
 
     lo, hi = min(pixels), max(pixels)
     span = max(hi - lo, 1)
+    BLANK_CUTOFF = 0.86  # anything this bright renders as true blank, no faint dot
 
     def normalize(lum):
         v = (lum - lo) / span
-        v = v ** 0.72  # gamma: push midtones darker for more visible strokes
+        v = v ** 0.8
         return max(0.0, min(1.0, v))
 
     art_w, art_h = cols * cw, rows * ch
@@ -161,6 +162,9 @@ def ascii_art_svg(img, avail_w, avail_h, row_fade, cw=2.6, ch=4.8):
         row_chars = []
         for c in range(cols):
             v = normalize(pixels[r * cols + c])
+            if v >= BLANK_CUTOFF:
+                row_chars.append(" ")
+                continue
             density = min(len(ASCII_RAMP) - 1, int((1 - v) * (len(ASCII_RAMP) - 1)))
             row_chars.append(ASCII_RAMP[density])
         row_text = esc("".join(row_chars)).replace(" ", "&#160;")
@@ -259,7 +263,7 @@ def build_svg(data):
     grid_y0 = month_label_y + 10
 
     GRID_BASE_DELAY = 0.55
-    GRID_COL_STEP = 0.014
+    GRID_COL_STEP = 0.03
 
     cells_svg, month_labels, day_labels = [], [], []
     last_month = None
@@ -270,7 +274,7 @@ def build_svg(data):
             x = grid_x0 + wi * (cell + gap)
             y = grid_y0 + di * (cell + gap)
             cells_svg.append(
-                f'<rect class="rv-cell" style="animation-delay:{col_delay:.3f}s" x="{x}" y="{y}" '
+                f'<rect class="rv-cell" style="--c:{LEVEL_COLORS[lvl]};animation-delay:{col_delay:.3f}s" x="{x}" y="{y}" '
                 f'width="{cell}" height="{cell}" rx="2" fill="{LEVEL_COLORS[lvl]}"/>'
             )
             if di == 0:
@@ -398,13 +402,13 @@ def build_svg(data):
     text{dominant-baseline:hanging;}
     .rv{animation:rv .45s ease-out backwards;}
     .rv-up{animation:rvup .45s ease-out backwards;}
-    .rv-cell{animation:rvcell .3s ease-out backwards;transform-box:fill-box;transform-origin:center;}
+    .rv-cell{animation:rvcell .55s cubic-bezier(.2,.75,.3,1) backwards;transform-box:fill-box;transform-origin:center;}
     .rv-bar{animation:rvbar .45s cubic-bezier(.22,.9,.32,1) backwards;transform-box:fill-box;transform-origin:bottom;}
     .rv-clip{animation:rvclip .6s steps(18,end) both;}
     .cursor{animation:blink 1s steps(1,end) infinite;}
     @keyframes rv{from{opacity:0}to{opacity:1}}
     @keyframes rvup{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-    @keyframes rvcell{from{opacity:0;transform:scale(.4)}to{opacity:1;transform:scale(1)}}
+    @keyframes rvcell{0%{fill:#0d1117;opacity:.5;transform:scale(.55)}40%{fill:#7cffb3;opacity:1;transform:scale(1.1)}100%{fill:var(--c);opacity:1;transform:scale(1)}}
     @keyframes rvbar{from{transform:scaleY(0)}to{transform:scaleY(1)}}
     @keyframes rvclip{from{width:0}to{width:var(--w)}}
     @keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
