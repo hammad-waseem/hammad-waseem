@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
 """Generates assets/card.svg: a terminal-styled GitHub profile card built
-from this account's real contribution + language data. Run locally with
-GH_TOKEN set (or via `gh auth token`), or in CI with GITHUB_TOKEN."""
+from this account's real contribution + language data, plus an ASCII-art
+rendering of the account's real avatar. Run locally with GH_TOKEN set (or
+via `gh auth token`), or in CI with GITHUB_TOKEN."""
 
+import io
 import json
-import math
 import os
 import sys
 import urllib.request
 from datetime import datetime
 
+from PIL import Image
+
 USERNAME = os.environ.get("CARD_USERNAME", "hammad-waseem")
 TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
 OUT_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "card.svg")
+
+MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+MONTH_ABBR = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+DAY_LABELS = {1: "Mon", 3: "Wed", 5: "Fri"}
 
 GRAPHQL_QUERY = """
 query($login: String!) {
   user(login: $login) {
     name
     bio
+    avatarUrl(size: 200)
     contributionsCollection {
       contributionCalendar {
         totalContributions
         weeks { contributionDays { date contributionCount } }
-      }
-    }
-    repositories(first: 100, ownerAffiliations: OWNER, isFork: false) {
-      totalCount
-      nodes {
-        languages(first: 6, orderBy: {field: SIZE, direction: DESC}) {
-          edges { size node { name } }
-        }
       }
     }
   }
@@ -42,14 +42,15 @@ def fetch():
     req = urllib.request.Request(
         "https://api.github.com/graphql",
         data=json.dumps({"query": GRAPHQL_QUERY, "variables": {"login": USERNAME}}).encode(),
-        headers={
-            "Authorization": f"Bearer {TOKEN}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req) as resp:
         return json.load(resp)["data"]["user"]
+
+
+def esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def flatten_days(calendar):
@@ -60,29 +61,43 @@ def flatten_days(calendar):
     return days
 
 
+def runs(counts):
+    """Yield (start_idx, end_idx, length) for every run of consecutive >0 values."""
+    start = None
+    for i, c in enumerate(counts):
+        if c > 0 and start is None:
+            start = i
+        elif c == 0 and start is not None:
+            yield (start, i - 1, i - start)
+            start = None
+    if start is not None:
+        yield (start, len(counts) - 1, len(counts) - start)
+
+
 def compute_streaks(days):
     counts = [c for _, c in days]
-    longest = cur = 0
-    for c in counts:
-        if c > 0:
-            cur += 1
-            longest = max(longest, cur)
-        else:
-            cur = 0
+    all_runs = list(runs(counts))
+    longest = max(all_runs, key=lambda r: r[2], default=(0, 0, 0))
 
     idx = len(counts) - 1
     if idx >= 0 and counts[idx] == 0:
         idx -= 1
-    current = 0
+    current_len = 0
+    end = idx
     while idx >= 0 and counts[idx] > 0:
-        current += 1
+        current_len += 1
         idx -= 1
+    current = (idx + 1, end, current_len)
     return current, longest
 
 
+def fmt_date(date_str):
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    return f"{MONTH_ABBR[d.month]} {d.day}"
+
+
 def monthly_buckets(days):
-    buckets = {}
-    order = []
+    buckets, order = {}, []
     for date_str, count in days:
         key = date_str[:7]
         if key not in buckets:
@@ -93,7 +108,7 @@ def monthly_buckets(days):
     return [(k, buckets[k]) for k in order]
 
 
-def level_for(count, p1, p2, p3, p4):
+def level_for(count, p1, p2, p3):
     if count == 0:
         return 0
     if count <= p1:
@@ -105,196 +120,252 @@ def level_for(count, p1, p2, p3, p4):
     return 4
 
 
-def esc(s):
+LEVEL_COLORS = ["#161b22", "#0e4429", "#006d32", "#26a641", "#39d353"]
+ASCII_RAMP = " .:-=+*#%@"
+
+
+def fetch_avatar(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "profile-card-generator"})
+    with urllib.request.urlopen(req) as resp:
+        img = Image.open(io.BytesIO(resp.read())).convert("L")
+    w, h = img.size
+    # focus on head/shoulders: drop the lower strip of a square avatar
+    img = img.crop((0, 0, w, int(h * 0.82)))
+    return img
+
+
+def ascii_art_svg(img, avail_w, avail_h, cw=4, ch=7):
+    rows = max(1, int(avail_h // ch))
+    cols = max(1, min(int(avail_w // cw), round(rows * ch / cw)))
+    rows = max(1, round(cols * cw / ch))
+    small = img.resize((cols, rows), Image.LANCZOS)
+    pixels = list(small.getdata())
+
+    lo, hi = min(pixels), max(pixels)
+    span = max(hi - lo, 1)
+
+    def normalize(lum):
+        v = (lum - lo) / span
+        v = v ** 0.7  # gamma: push midtones darker for more visible strokes
+        return max(0.0, min(1.0, v))
+
+    art_w, art_h = cols * cw, rows * ch
+    ox = (avail_w - art_w) / 2
+    oy = (avail_h - art_h) / 2
+
+    parts = []
+    for r in range(rows):
+        row_chars = []
+        for c in range(cols):
+            v = normalize(pixels[r * cols + c])
+            density = min(len(ASCII_RAMP) - 1, int((1 - v) * (len(ASCII_RAMP) - 1)))
+            row_chars.append(ASCII_RAMP[density])
+        row_text = "".join(row_chars).replace(" ", "&#160;")
+        y = oy + r * ch + ch * 0.8
+        parts.append(
+            f'<text x="{ox:.1f}" y="{y:.1f}" font-size="{ch*1.05:.1f}" xml:space="preserve" '
+            f'fill="#c9d1d9" font-family="{MONO}" letter-spacing="-0.3">{row_text}</text>'
+        )
+    return "".join(parts)
+
+
+def prompt_line(width, y, cmd, size=13):
     return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
+        f'<text x="{width/2:.1f}" y="{y}" font-size="{size}" text-anchor="middle" xml:space="preserve" '
+        f'font-family="{MONO}">'
+        f'<tspan fill="#7ee787" font-weight="700">{esc(USERNAME)}@github</tspan>'
+        f'<tspan fill="#8b949e"> ~ </tspan>'
+        f'<tspan fill="#58a6ff">$</tspan>'
+        f'<tspan fill="#e6edf3"> {esc(cmd)}</tspan></text>'
     )
 
 
-PALETTE = ["#58a6ff", "#7ee787", "#d2a8ff", "#ffa657", "#79c0ff", "#f0883e", "#56d4dd"]
-LEVEL_COLORS = ["#161b22", "#0e4429", "#006d32", "#26a641", "#39d353"]
+def mini_chrome(x, y, w, title):
+    return (
+        f'<rect x="{x}" y="{y}" width="{w}" height="22" rx="6" fill="#0d1117"/>'
+        f'<circle cx="{x+14}" cy="{y+11}" r="3.5" fill="#ff5f56"/>'
+        f'<circle cx="{x+26}" cy="{y+11}" r="3.5" fill="#ffbd2e"/>'
+        f'<circle cx="{x+38}" cy="{y+11}" r="3.5" fill="#27c93f"/>'
+        f'<text x="{x+w/2:.1f}" y="{y+11}" font-size="10" fill="#8b949e" text-anchor="middle" '
+        f'dominant-baseline="middle" font-family="{MONO}">{esc(title)}</text>'
+    )
 
 
-def pack_words(words, box_w, box_h):
-    """Greedy row-packing of (text, size) tuples into centered rows."""
-    rows = []
-    current_row = []
-    current_w = 0
-    max_row_w = box_w - 20
-    for text, size in words:
-        w = len(text) * size * 0.62 + 18
-        if current_row and current_w + w > max_row_w:
-            rows.append((current_row, current_w))
-            current_row = []
-            current_w = 0
-        current_row.append((text, size, w))
-        current_w += w
-    if current_row:
-        rows.append((current_row, current_w))
-
-    total_h = sum(max(s for _, s, _ in row) * 1.35 for row, _ in rows) if rows else 0
-    scale = min(1.0, (box_h - 20) / total_h) if total_h > box_h - 20 else 1.0
-
-    svg_parts = []
-    y = (box_h - total_h * scale) / 2 + 14
-    for row, row_w in rows:
-        row_h = max(s for _, s, _ in row) * scale
-        x = (box_w - row_w * scale) / 2
-        for i, (text, size, w) in enumerate(row):
-            fsize = size * scale
-            color = PALETTE[hash(text) % len(PALETTE)]
-            svg_parts.append(
-                f'<text x="{x + w*scale/2:.1f}" y="{y:.1f}" font-size="{fsize:.1f}" '
-                f'fill="{color}" text-anchor="middle" font-weight="600" '
-                f'font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">{esc(text)}</text>'
-            )
-            x += w * scale
-        y += row_h * 1.35
-    return "".join(svg_parts)
+def stat_cell(x, y, w, label, value, sub, value_color="#e6edf3"):
+    return (
+        f'<text x="{x}" y="{y}" font-size="10.5" fill="#6e7681" font-family="{MONO}">$ {esc(label)}</text>'
+        f'<text x="{x}" y="{y+22}" font-size="20" font-weight="700" fill="{value_color}" font-family="{MONO}">{esc(value)}</text>'
+        f'<text x="{x}" y="{y+38}" font-size="9.5" fill="#6e7681" font-family="{MONO}">{esc(sub)}</text>'
+    )
 
 
 def build_svg(data):
     name = data.get("name") or USERNAME
     bio = data.get("bio") or ""
+    avatar_url = data.get("avatarUrl")
     calendar = data["contributionsCollection"]["contributionCalendar"]
     total = calendar["totalContributions"]
     days = flatten_days(calendar)
-    counts = [c for _, c in days if c > 0]
-    current_streak, longest_streak = compute_streaks(days)
-    days_active = len(counts)
-    best_day = max((c for _, c in days), default=0)
-    avg_active = (sum(counts) / len(counts)) if counts else 0
+    counts = [c for _, c in days]
+    nz = [c for c in counts if c > 0]
+    days_active = len(nz)
+    pct_active = round(days_active / len(days) * 100) if days else 0
+    avg_active = (sum(nz) / len(nz)) if nz else 0
 
-    nonzero_sorted = sorted(counts)
+    current, longest = compute_streaks(days)
+    best_idx = max(range(len(days)), key=lambda i: days[i][1]) if days else 0
+    best_day_count = days[best_idx][1] if days else 0
+
+    s = sorted(nz)
     def pct(p):
-        if not nonzero_sorted:
+        if not s:
             return 0
-        idx = min(len(nonzero_sorted) - 1, int(len(nonzero_sorted) * p))
-        return nonzero_sorted[idx]
-    p1, p2, p3, p4 = pct(0.25), pct(0.5), pct(0.75), pct(1.0)
+        return s[min(len(s) - 1, int(len(s) * p))]
+    p1, p2, p3 = pct(0.25), pct(0.5), pct(0.75)
 
-    # --- contribution grid ---
+    width = 900
+
+    # ---------- section 1: contributions.sh ----------
     weeks = calendar["weeks"]
-    cell = 10
-    gap = 3
-    grid_x0 = 40
-    grid_y0 = 90
-    cells_svg = []
-    month_labels = []
+    cell, gap = 10, 3
+    grid_x0 = 56
+    sec1_top = 36
+    prompt1_y = sec1_top + 26
+    month_label_y = prompt1_y + 24
+    grid_y0 = month_label_y + 10
+
+    cells_svg, month_labels, day_labels = [], [], []
     last_month = None
     for wi, week in enumerate(weeks):
         for di, day in enumerate(week["contributionDays"]):
-            lvl = level_for(day["contributionCount"], p1, p2, p3, p4)
+            lvl = level_for(day["contributionCount"], p1, p2, p3)
             x = grid_x0 + wi * (cell + gap)
             y = grid_y0 + di * (cell + gap)
-            cells_svg.append(
-                f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" rx="2" fill="{LEVEL_COLORS[lvl]}"/>'
-            )
+            cells_svg.append(f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" rx="2" fill="{LEVEL_COLORS[lvl]}"/>')
             if di == 0:
                 m = day["date"][5:7]
                 if m != last_month:
                     month_labels.append(
-                        f'<text x="{x}" y="{grid_y0 - 10}" font-size="10" fill="#8b949e" '
-                        f'font-family="ui-monospace,monospace">{["","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][int(m)]}</text>'
+                        f'<text x="{x}" y="{month_label_y}" font-size="10" fill="#8b949e" font-family="{MONO}">{MONTH_ABBR[int(m)]}</text>'
                     )
                     last_month = m
-    grid_w = grid_x0 + len(weeks) * (cell + gap)
-    grid_h = grid_y0 + 7 * (cell + gap) + 30
+    for di, lbl in DAY_LABELS.items():
+        y = grid_y0 + di * (cell + gap) + cell - 1
+        day_labels.append(f'<text x="{grid_x0-8}" y="{y}" font-size="9" fill="#6e7681" text-anchor="end" font-family="{MONO}">{lbl}</text>')
 
-    # --- monthly bar chart ---
+    grid_bottom = grid_y0 + 7 * (cell + gap)
+    total_line_y = grid_bottom + 22
+    sec1_bottom = total_line_y + 20
+
+    # ---------- section 2: whoami (two mini terminals) ----------
+    prompt2_y = sec1_bottom + 30
+    sub_top = prompt2_y + 22
+    col_gap = 16
+    margin = 24
+    col_w = (width - margin * 2 - col_gap) / 2
+    left_x = margin
+    right_x = margin + col_w + col_gap
+
+    # right (stats) content sizing drives both heights
+    row_h, row_gap = 48, 14
+    stats_pad = 18
+    stats_rows_h = row_h * 3 + row_gap * 2
+    bar_box_h = 72
+    bar_gap = 18
+    right_content_h = 22 + stats_pad + stats_rows_h + bar_gap + bar_box_h + 14
+    sub_h = right_content_h
+
+    # left (ascii art) chrome + footer caption
+    footer_h = 34
+    art_avail_w = col_w - 24
+    art_avail_h = sub_h - 22 - footer_h - 10
+
+    try:
+        img = fetch_avatar(avatar_url) if avatar_url else None
+        art_svg = ascii_art_svg(img, art_avail_w, art_avail_h) if img else ""
+    except Exception as e:
+        print(f"avatar fetch/render failed: {e}", file=sys.stderr)
+        art_svg = ""
+
+    sub_bottom = sub_top + sub_h
+    sec2_bottom = sub_bottom + 16
+
+    # ---------- section 3: links.sh ----------
+    prompt3_y = sec2_bottom + 30
+    tagline_y = prompt3_y + 22
+    note_y = tagline_y + 24
+    height = note_y + 30
+
     months = monthly_buckets(days)
-    bar_box_w = 260
-    bar_box_h = 82
     max_m = max((v for _, v in months), default=1) or 1
-    bar_w = bar_box_w / max(len(months), 1) - 4
+    peak_i = max(range(len(months)), key=lambda i: months[i][1]) if months else 0
+    bar_w = (col_w - 2 * stats_pad) / max(len(months), 1) - 4
     bars_svg = []
-    month_abbr = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    chart_w = col_w - 2 * stats_pad
     for i, (label, v) in enumerate(months):
-        h = (v / max_m) * (bar_box_h - 14)
-        x = i * (bar_box_w / max(len(months), 1))
-        y = bar_box_h - 14 - h
-        bars_svg.append(
-            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{h:.1f}" rx="1.5" fill="#26a641"/>'
-            f'<text x="{x + bar_w/2:.1f}" y="{bar_box_h-10:.1f}" font-size="8" fill="#6e7681" '
-            f'text-anchor="middle" font-family="ui-monospace,monospace">{month_abbr[int(label[5:7])]}</text>'
-        )
+        h = (v / max_m) * (bar_box_h - 24)
+        x = i * (chart_w / max(len(months), 1))
+        y = bar_box_h - 16 - h
+        bar_color = "#39d353" if i == peak_i else "#26a641"
+        bars_svg.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{max(h,1.5):.1f}" rx="1.5" fill="{bar_color}"/>')
+        bars_svg.append(f'<text x="{x+bar_w/2:.1f}" y="{bar_box_h:.1f}" font-size="8" fill="#6e7681" text-anchor="middle" font-family="{MONO}">{MONTH_ABBR[int(label[5:7])][0]}</text>')
+        if i == peak_i and v > 0:
+            bars_svg.append(f'<text x="{x+bar_w/2:.1f}" y="{y-5:.1f}" font-size="9" fill="#39d353" text-anchor="middle" font-weight="700" font-family="{MONO}">{v:,}</text>')
 
-    # --- language word cloud ---
-    lang_bytes = {}
-    for repo in data["repositories"]["nodes"]:
-        for edge in repo["languages"]["edges"]:
-            lang_bytes[edge["node"]["name"]] = lang_bytes.get(edge["node"]["name"], 0) + edge["size"]
-    langs = sorted(lang_bytes.items(), key=lambda x: -x[1])[:9]
-    if langs:
-        mx, mn = math.log(langs[0][1] + 1), math.log(langs[-1][1] + 1)
-        span = max(mx - mn, 1e-6)
-        words = [(name_, 14 + 28 * ((math.log(b + 1) - mn) / span)) for name_, b in langs]
-    else:
-        words = []
-    cloud_box_w, cloud_box_h = 260, 150
-    cloud_svg = pack_words(words, cloud_box_w, cloud_box_h)
+    cur_start, cur_end, cur_len = current
+    lon_start, lon_end, lon_len = longest
+    cur_range = f"{fmt_date(days[cur_start][0])} – {fmt_date(days[cur_end][0])}" if cur_len else "—"
+    lon_range = f"{fmt_date(days[lon_start][0])} – {fmt_date(days[lon_end][0])}" if lon_len else "—"
 
-    width = max(grid_w + 40, 900)
-    height = grid_h + 420
+    r1y = sub_top + 22 + stats_pad + 14
+    r2y = r1y + row_h + row_gap
+    r3y = r2y + row_h + row_gap
+    chart_y = r3y + row_h + bar_gap
 
-    def prompt_line(y, cmd):
-        return (
-            f'<text x="24" y="{y}" font-size="13" xml:space="preserve" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">'
-            f'<tspan fill="#7ee787" font-weight="700">{esc(USERNAME)}@github</tspan>'
-            f'<tspan fill="#8b949e"> ~ </tspan>'
-            f'<tspan fill="#58a6ff">$</tspan>'
-            f'<tspan fill="#e6edf3"> {esc(cmd)}</tspan></text>'
-        )
-
-    whoami_y = grid_h + 50
-    col2_x = 320
+    stats_svg = "".join([
+        stat_cell(right_x + stats_pad, r1y, col_w / 2, "current_streak", f"{cur_len} days", cur_range, "#39d353"),
+        stat_cell(right_x + col_w / 2, r1y, col_w / 2, "longest_streak", f"{lon_len} days", lon_range),
+        stat_cell(right_x + stats_pad, r2y, col_w / 2, "contributions", f"{total:,}", "in the last year"),
+        stat_cell(right_x + col_w / 2, r2y, col_w / 2, "active_days", f"{days_active} / {len(days)}", f"{pct_active}% of the year"),
+        stat_cell(right_x + stats_pad, r3y, col_w / 2, "best_day", f"{best_day_count}", fmt_date(days[best_idx][0]) if days else ""),
+        stat_cell(right_x + col_w / 2, r3y, col_w / 2, "avg / active_day", f"{avg_active:.1f}", "contributions"),
+        f'<text x="{right_x+stats_pad}" y="{chart_y-8}" font-size="10.5" fill="#6e7681" font-family="{MONO}">$ contributions / month</text>',
+        f'<g transform="translate({right_x+stats_pad},{chart_y})">{"".join(bars_svg)}</g>',
+    ])
 
     svg = f'''<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <style>text{{dominant-baseline:hanging;}}</style>
-  </defs>
+  <defs><style>text{{dominant-baseline:hanging;}}</style></defs>
   <rect x="0" y="0" width="{width}" height="{height}" rx="14" fill="#0d1117" stroke="#30363d"/>
-  <circle cx="24" cy="20" r="6" fill="#ff5f56"/>
-  <circle cx="44" cy="20" r="6" fill="#ffbd2e"/>
-  <circle cx="64" cy="20" r="6" fill="#27c93f"/>
-  <text x="{width/2}" y="16" font-size="12" fill="#8b949e" text-anchor="middle" font-family="ui-monospace,monospace">{esc(USERNAME)} — zsh</text>
-  <line x1="0" y1="36" x2="{width}" y2="36" stroke="#21262d"/>
+  <circle cx="24" cy="18" r="6" fill="#ff5f56"/>
+  <circle cx="44" cy="18" r="6" fill="#ffbd2e"/>
+  <circle cx="64" cy="18" r="6" fill="#27c93f"/>
+  <text x="{width/2}" y="13" font-size="12" fill="#8b949e" text-anchor="middle" font-family="{MONO}">{esc(USERNAME)} — zsh</text>
+  <line x1="0" y1="34" x2="{width}" y2="34" stroke="#21262d"/>
 
-  {prompt_line(58, "./contributions.sh")}
+  {prompt_line(width, prompt1_y, "./contributions.sh")}
   {"".join(month_labels)}
+  {"".join(day_labels)}
   {"".join(cells_svg)}
-  <text x="{grid_x0}" y="{grid_h - 6}" font-size="12" fill="#8b949e" font-family="ui-monospace,monospace">{total:,} contributions in the last year</text>
+  <text x="{grid_x0}" y="{total_line_y}" font-size="12" fill="#8b949e" font-family="{MONO}">{total:,} contributions in the last year</text>
 
-  {prompt_line(whoami_y, "whoami")}
+  {prompt_line(width, prompt2_y, "whoami")}
 
-  <rect x="24" y="{whoami_y+14}" width="{cloud_box_w}" height="{cloud_box_h}" rx="8" fill="#161b22" stroke="#21262d"/>
-  <g transform="translate(24,{whoami_y+14})">{cloud_svg}</g>
+  <rect x="{left_x}" y="{sub_top}" width="{col_w}" height="{sub_h}" rx="8" fill="#161b22" stroke="#21262d"/>
+  {mini_chrome(left_x, sub_top, col_w, f"{USERNAME} — art.sh")}
+  <g transform="translate({left_x+12},{sub_top+22+6})">{art_svg}</g>
+  <line x1="{left_x+10}" y1="{sub_bottom-footer_h}" x2="{left_x+col_w-10}" y2="{sub_bottom-footer_h}" stroke="#21262d"/>
+  <text x="{left_x+14}" y="{sub_bottom-footer_h+9}" font-size="9.5" xml:space="preserve" font-family="{MONO}">
+    <tspan fill="#7ee787">{esc(USERNAME)}@github</tspan><tspan fill="#8b949e"> ~ </tspan><tspan fill="#58a6ff">$</tspan><tspan fill="#e6edf3"> whoami</tspan>
+  </text>
+  <text x="{left_x+14}" y="{sub_bottom-14}" font-size="11" fill="#e6edf3" font-weight="700" font-family="{MONO}">{esc(name)} ▸</text>
 
-  <g transform="translate({col2_x},{whoami_y+14})">
-    <rect x="0" y="0" width="100" height="56" rx="6" fill="#161b22" stroke="#21262d"/>
-    <text x="10" y="12" font-size="20" fill="#39d353" font-weight="700" font-family="ui-monospace,monospace">{current_streak}</text>
-    <text x="10" y="36" font-size="10" fill="#8b949e" font-family="ui-monospace,monospace">current streak</text>
+  <rect x="{right_x}" y="{sub_top}" width="{col_w}" height="{sub_h}" rx="8" fill="#161b22" stroke="#21262d"/>
+  {mini_chrome(right_x, sub_top, col_w, f"{USERNAME} — stats.sh")}
+  {stats_svg}
 
-    <rect x="108" y="0" width="100" height="56" rx="6" fill="#161b22" stroke="#21262d"/>
-    <text x="118" y="12" font-size="20" fill="#e6edf3" font-weight="700" font-family="ui-monospace,monospace">{longest_streak}</text>
-    <text x="118" y="36" font-size="10" fill="#8b949e" font-family="ui-monospace,monospace">longest streak</text>
-
-    <rect x="0" y="64" width="100" height="56" rx="6" fill="#161b22" stroke="#21262d"/>
-    <text x="10" y="76" font-size="20" fill="#e6edf3" font-weight="700" font-family="ui-monospace,monospace">{total}</text>
-    <text x="10" y="100" font-size="10" fill="#8b949e" font-family="ui-monospace,monospace">total this year</text>
-
-    <rect x="108" y="64" width="100" height="56" rx="6" fill="#161b22" stroke="#21262d"/>
-    <text x="118" y="76" font-size="20" fill="#e6edf3" font-weight="700" font-family="ui-monospace,monospace">{days_active}</text>
-    <text x="118" y="100" font-size="10" fill="#8b949e" font-family="ui-monospace,monospace">days active</text>
-
-    <text x="0" y="134" font-size="10" fill="#8b949e" font-family="ui-monospace,monospace">best day: {best_day}  ·  avg/active day: {avg_active:.1f}</text>
-    <g transform="translate(0,150)">{"".join(bars_svg)}</g>
-  </g>
-
-  <text x="24" y="{height-20}" font-size="11" fill="#30363d" font-family="ui-monospace,monospace">{esc(name)}{(" · " + esc(bio)) if bio else ""}</text>
+  {prompt_line(width, prompt3_y, "./links.sh")}
+  <text x="{width/2}" y="{tagline_y}" font-size="11.5" fill="#8b949e" text-anchor="middle" font-family="{MONO}">{esc(bio) if bio else "GitHub profile"}</text>
+  <text x="{width/2}" y="{note_y}" font-size="10" fill="#484f58" text-anchor="middle" font-family="{MONO}">↓ links below ↓</text>
 </svg>'''
     return svg
 
